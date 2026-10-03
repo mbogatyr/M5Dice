@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M5Dice prototype</title>
+<!--
+  Reference of the firmware's look and motion at the real StickS3
+  resolution, 135x240 portrait: the felt table, ivory dice, thin captions
+  (variant "A with B's fonts", picked by comparing three variants).
+
+  It is a software rasterizer in plain JavaScript, written so that lib/
+  ports it one to one: lib/DiceMesh (the rounded cube, grid G), lib/DiceRaster
+  (shade(), drawDie(), shadowPass(), the felt), lib/RollPlanner (startRoll(),
+  poseAt(), splashDice()), lib/DiceScreen (ui()). Change the look here first,
+  check it in a browser, then move the change to the firmware and compare
+  with tools/preview.
+
+  Differences on the board: one view direction per die instead of per pixel,
+  lookup tables instead of pow(), RGB565 with ordered dither, and the
+  helvetica fallback here is Inter there (assets/fonts).
+
+  Buttons under each device: Roll = KEY1, Mode = KEY2, Shake, Pick up (wakes
+  the screen).
+-->
+<style>
+body{margin:0;padding:24px;background:#f4f3ef;color:#2c2c2a;font:14px/1.5 -apple-system,system-ui,sans-serif}
+@media (prefers-color-scheme:dark){body{background:#1d1d1f;color:#e8e6df}}
+.scr{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 16px;max-width:700px}
+button{font:inherit;font-size:13px;padding:4px 10px;border-radius:8px;border:1px solid #9998;background:transparent;color:inherit;cursor:pointer}
+.dv{display:flex;gap:12px;flex-wrap:wrap}
+.dev{display:flex;flex-direction:column;align-items:center;gap:8px}
+.bd{background:#202022;border-radius:22px;padding:12px 12px 14px;display:flex;flex-direction:column;align-items:center;gap:11px;position:relative}
+.bd canvas{width:270px;height:480px;border-radius:3px;display:block;background:#000}
+.k1{width:56px;height:16px;border-radius:8px;background:#2f6fd6;border:none;cursor:pointer;padding:0}
+.k2{position:absolute;right:-5px;top:110px;width:5px;height:50px;border-radius:0 3px 3px 0;background:#666;cursor:pointer;border:none;padding:0}
+.ctl{display:flex;gap:4px;flex-wrap:wrap;justify-content:center}
+.ctl button{font-size:12px;padding:3px 7px}
+@keyframes shk{0%,100%{transform:translate(0,0) rotate(0)}25%{transform:translate(-4px,2px) rotate(-3deg)}75%{transform:translate(4px,-2px) rotate(3deg)}}
+.shaking{animation:shk .11s linear 4}
+</style>
+</head>
+<body>
+<div class="scr">
+<button data-s="splash">Splash</button><button data-s="one">One die</button><button data-s="two">Two dice</button><button data-s="roll">Roll</button><button data-s="mode">Mode switch</button><button data-s="off">Screen off</button>
+<label style="display:flex;align-items:center;gap:4px;margin-left:auto"><input type="checkbox" id="snd" checked>Sound</label>
+</div>
+<div class="dv">
+<div class="dev"><div class="bd" id="b0"><canvas id="c0" width="135" height="240"></canvas><button class="k1" aria-label="KEY1 roll"></button><button class="k2" aria-label="KEY2 mode"></button></div><div class="ctl"><button data-a="roll">Roll</button><button data-a="mode">Mode</button><button data-a="shake">Shake</button><button data-a="wake">Pick up</button></div></div>
+<div class="dev"><div class="bd" id="b1"><canvas id="c1" width="135" height="240"></canvas><button class="k1" aria-label="KEY1 roll"></button><button class="k2" aria-label="KEY2 mode"></button></div><div class="ctl"><button data-a="roll">Roll</button><button data-a="mode">Mode</button><button data-a="shake">Shake</button><button data-a="wake">Pick up</button></div></div>
+</div>
+<script>
+const W=135,H=240,D=360,TAU=Math.PI*2;
+const nrm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l]};
+const L=nrm([-.4,-.5,.85]);
+const sm=(a,b,x)=>{const t=Math.min(1,Math.max(0,(x-a)/(b-a)));return t*t*(3-2*t)};
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const rv=()=>1+Math.floor(Math.random()*6);
+const now=()=>performance.now()/1000;
+function qm(a,b){return[a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3],a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1],a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]]}
+function qa(ax,an){ax=nrm(ax);const s=Math.sin(an/2);return[Math.cos(an/2),ax[0]*s,ax[1]*s,ax[2]*s]}
+const qi=q=>[q[0],-q[1],-q[2],-q[3]];
+function qs(a,b,t){let d=a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3],c=b;if(d<0){d=-d;c=b.map(x=>-x)}let r;if(d>.9995){r=a.map((x,i)=>x+(c[i]-x)*t)}else{const th=Math.acos(d),s=Math.sin(th),wa=Math.sin((1-t)*th)/s,wb=Math.sin(t*th)/s;r=a.map((x,i)=>x*wa+c[i]*wb)}const l=Math.hypot(r[0],r[1],r[2],r[3]);return r.map(x=>x/l)}
+function qmat(q){const[w,x,y,z]=q;return[1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y),2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x),2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)]}
+const mv=(m,v)=>[m[0]*v[0]+m[1]*v[1]+m[2]*v[2],m[3]*v[0]+m[4]*v[1]+m[5]*v[2],m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];
+const FACES=[{n:[0,0,1],t:[1,0,0],b:[0,1,0],val:1},{n:[0,0,-1],t:[-1,0,0],b:[0,1,0],val:6},{n:[1,0,0],t:[0,1,0],b:[0,0,1],val:3},{n:[-1,0,0],t:[0,-1,0],b:[0,0,1],val:4},{n:[0,1,0],t:[-1,0,0],b:[0,0,1],val:2},{n:[0,-1,0],t:[1,0,0],b:[0,0,1],val:5}];
+const V2F={};FACES.forEach((f,i)=>V2F[f.val]=i);
+function qUp(val,yaw){const n=FACES[V2F[val]].n;let q;if(n[2]>.5)q=[1,0,0,0];else if(n[2]<-.5)q=qa([1,0,0],Math.PI);else q=qa([n[1],-n[0],0],Math.PI/2);return qm(qa([0,0,1],yaw),q)}
+const PIPS={1:[[0,0]],2:[[-.5,-.5],[.5,.5]],3:[[-.5,-.5],[0,0],[.5,.5]],4:[[-.5,-.5],[.5,-.5],[-.5,.5],[.5,.5]],5:[[-.5,-.5],[.5,-.5],[0,0],[-.5,.5],[.5,.5]],6:[[-.5,-.5],[.5,-.5],[-.5,0],[.5,0],[-.5,.5],[.5,.5]]};
+const G=[-1,-.907,-.839,-.78,-.39,0,.39,.78,.839,.907,1],RR=.22,IN=.78,NG=G.length;
+const mp=[],mn=[],muv=[],tr=[];
+FACES.forEach((F,fi)=>{const base=mp.length/3;for(let i=0;i<NG;i++)for(let j=0;j<NG;j++){const u=G[i],v=G[j];const c=[0,1,2].map(e=>F.n[e]+u*F.t[e]+v*F.b[e]);const inn=c.map(x=>Math.max(-IN,Math.min(IN,x)));const dn=nrm([c[0]-inn[0],c[1]-inn[1],c[2]-inn[2]]);mp.push(inn[0]+dn[0]*RR,inn[1]+dn[1]*RR,inn[2]+dn[2]*RR);mn.push(dn[0],dn[1],dn[2]);muv.push(u,v)}
+for(let i=0;i<NG-1;i++)for(let j=0;j<NG-1;j++){const a=base+i*NG+j,b=base+(i+1)*NG+j,c=b+1,e=a+1;tr.push(a,b,c,fi,a,c,e,fi)}});
+const MP=Float32Array.from(mp),MN=Float32Array.from(mn),MUV=Float32Array.from(muv),TR=Int32Array.from(tr),NV=mp.length/3;
+const SX=new Float32Array(NV),SY=new Float32Array(NV),WX=new Float32Array(NV),WY=new Float32Array(NV),WZ=new Float32Array(NV),NX=new Float32Array(NV),NY=new Float32Array(NV),NZ=new Float32Array(NV);
+const lin=c=>c.map(x=>Math.pow(x,2.2));
+const ST={body:lin([.95,.92,.84]),pip:lin([.07,.07,.08]),pip1:lin([.74,.05,.08]),r:.18,r1:.27,kd:.75,amb:.25,ks:.35,sh:40,ks2:.03,sh2:6,env:[.012,.11,.045,.05,.05,.05],box:5,shadow:.55};
+const VB={yT:-96,yB:82};
+function hash(x,y){let h=(Math.imul(x,374761393)+Math.imul(y,668265263))|0;h=Math.imul(h^(h>>>13),1274126177);return((h^(h>>>16))>>>0)/4294967296}
+function bgS(x,y){const n=hash(x,y)-.5,dx=(x-W*.38)/W,dy=(y-H*.34)/H,r2=dx*dx*1.4+dy*dy;const f=Math.max(.3,1-1.1*r2)*(1+n*.12+(hash(x>>1,y*3)-.5)*.08);return[.12*f,.4*f,.26*f]}
+const BG={};
+function getBg(k){if(BG[k])return BG[k];const w=W*k,h=H*k,a=new Float32Array(w*h*3);for(let y=0;y<h;y++)for(let x=0;x<w;x++){const c=bgS(Math.floor(x/k),Math.floor(y/k)),i=(y*w+x)*3;a[i]=Math.pow(c[0],2.2);a[i+1]=Math.pow(c[1],2.2);a[i+2]=Math.pow(c[2],2.2)}return BG[k]=a}
+const LUT=new Uint8ClampedArray(4096);for(let i=0;i<4096;i++)LUT[i]=Math.round(255*Math.pow(i/4095,1/2.2));
+const tm=c=>c<.85?c:.85+.15*(1-Math.exp(-(c-.85)/.15));
+const OUT=new Float32Array(3);
+function shade(st,F,u,v,nx,ny,nz,px,py,pz,ps){let l=Math.hypot(nx,ny,nz)||1;nx/=l;ny/=l;nz/=l;let r=st.body[0],g=st.body[1],b=st.body[2],ao=1;const fv=F.v;
+if(u>-.8&&u<.8&&v>-.8&&v<.8){const R=fv===1?st.r1:st.r,P=PIPS[fv];for(let i=0;i<P.length;i++){const du=u-P[i][0],dv=v-P[i][1],dd=Math.sqrt(du*du+dv*dv);if(dd<R+ps){const m=Math.min(1,Math.max(0,(R+ps*.5-dd)/ps)),pc=fv===1?st.pip1:st.pip;r+=(pc[0]-r)*m;g+=(pc[1]-g)*m;b+=(pc[2]-b)*m;const sx=du/R*.8,sy=dv/R*.8,hh=Math.sqrt(Math.max(.05,1-sx*sx-sy*sy));const qx=-sx*F.t[0]-sy*F.b[0]+hh*F.n[0],qy=-sx*F.t[1]-sy*F.b[1]+hh*F.n[1],qz=-sx*F.t[2]-sy*F.b[2]+hh*F.n[2];nx+=(qx-nx)*m;ny+=(qy-ny)*m;nz+=(qz-nz)*m;l=Math.hypot(nx,ny,nz);nx/=l;ny/=l;nz/=l;ao=1-m*.3*Math.min(1,dd/R);break}}}
+let vx=-px,vy=-py,vz=D-pz;l=Math.hypot(vx,vy,vz);vx/=l;vy/=l;vz/=l;
+const ndl=Math.max(0,nx*L[0]+ny*L[1]+nz*L[2]),ndv=Math.max(0,nx*vx+ny*vy+nz*vz);
+const hx=L[0]+vx,hy=L[1]+vy,hz=L[2]+vz,hl=Math.hypot(hx,hy,hz),ndh=Math.max(0,(nx*hx+ny*hy+nz*hz)/hl);
+const sp=st.ks*Math.pow(ndh,st.sh)+st.ks2*Math.pow(ndh,st.sh2);
+const rx=2*ndv*nx-vx,ry=2*ndv*ny-vy,rz=2*ndv*nz-vz,fr=.04+.96*Math.pow(1-ndv,5);
+const bx=sm(.9,.97,rx*L[0]+ry*L[1]+rz*L[2])*st.box,sky=Math.max(0,rz),e=st.env;
+const dif=(st.amb*(.5+.5*nz)+st.kd*ndl)*ao;
+OUT[0]=r*dif+sp+fr*(e[0]*(1-sky)+e[3]*sky+bx);OUT[1]=g*dif+sp+fr*(e[1]*(1-sky)+e[4]*sky+bx);OUT[2]=b*dif+sp+fr*(e[2]*(1-sky)+e[5]*sky+bx)}
+function drawDie(col,zb,w,h,k,d,st){const R=qmat(d.q),s=d.s,PX=d.pos[0],PY=d.pos[1],PZ=d.pos[2];
+for(let i=0;i<NV;i++){const x=MP[i*3],y=MP[i*3+1],z=MP[i*3+2];const wx=(R[0]*x+R[1]*y+R[2]*z)*s+PX,wy=(R[3]*x+R[4]*y+R[5]*z)*s+PY,wz=(R[6]*x+R[7]*y+R[8]*z)*s+PZ;const sc=k*D/(D-wz);SX[i]=w/2+wx*sc;SY[i]=h/2+wy*sc;WX[i]=wx;WY[i]=wy;WZ[i]=wz;const a=MN[i*3],b=MN[i*3+1],c=MN[i*3+2];NX[i]=R[0]*a+R[1]*b+R[2]*c;NY[i]=R[3]*a+R[4]*b+R[5]*c;NZ[i]=R[6]*a+R[7]*b+R[8]*c}
+const FW=FACES.map(F=>({v:F.val,n:mv(R,F.n),t:mv(R,F.t),b:mv(R,F.b)}));const ps=(D-PZ)/(s*k*D);
+for(let q=0;q<TR.length;q+=4){const a=TR[q],b=TR[q+1],c=TR[q+2],F=FW[TR[q+3]];const ax=SX[a],ay=SY[a],bx=SX[b],by=SY[b],cx=SX[c],cy=SY[c];const area=(bx-ax)*(cy-ay)-(cx-ax)*(by-ay);if(area<=1e-6)continue;
+const x0=Math.max(0,Math.floor(Math.min(ax,bx,cx))),x1=Math.min(w-1,Math.ceil(Math.max(ax,bx,cx))),y0=Math.max(0,Math.floor(Math.min(ay,by,cy))),y1=Math.min(h-1,Math.ceil(Math.max(ay,by,cy)));const ia=1/area;
+for(let y=y0;y<=y1;y++){const py=y+.5;for(let x=x0;x<=x1;x++){const px=x+.5;const w0=((bx-px)*(cy-py)-(cx-px)*(by-py))*ia;if(w0<-1e-4)continue;const w1=((cx-px)*(ay-py)-(ax-px)*(cy-py))*ia;if(w1<-1e-4)continue;const w2=1-w0-w1;if(w2<-1e-4)continue;
+const z=w0*WZ[a]+w1*WZ[b]+w2*WZ[c],pi=y*w+x;if(z<=zb[pi])continue;zb[pi]=z;
+shade(st,F,w0*MUV[a*2]+w1*MUV[b*2]+w2*MUV[c*2],w0*MUV[a*2+1]+w1*MUV[b*2+1]+w2*MUV[c*2+1],w0*NX[a]+w1*NX[b]+w2*NX[c],w0*NY[a]+w1*NY[b]+w2*NY[c],w0*NZ[a]+w1*NZ[b]+w2*NZ[c],w0*WX[a]+w1*WX[b]+w2*WX[c],w0*WY[a]+w1*WY[b]+w2*WY[c],z,ps);
+col[pi*3]=OUT[0];col[pi*3+1]=OUT[1];col[pi*3+2]=OUT[2]}}}}
+function shadowPass(col,w,h,k,cx,cy,ox,oy,ang,hs,rr,soft,op){if(op<=.003)return;rr=Math.min(rr,hs);const ext=hs*1.5+soft*2;
+const x0=Math.max(0,Math.floor(w/2+(Math.min(cx,cx+ox)-ext)*k)),x1=Math.min(w-1,Math.ceil(w/2+(Math.max(cx,cx+ox)+ext)*k)),y0=Math.max(0,Math.floor(h/2+(Math.min(cy,cy+oy)-ext)*k)),y1=Math.min(h-1,Math.ceil(h/2+(Math.max(cy,cy+oy)+ext)*k));
+const ca=Math.cos(ang),sa=Math.sin(ang),e=hs-rr;
+for(let y=y0;y<=y1;y++){const Y=(y+.5-h/2)/k;for(let x=x0;x<=x1;x++){const X=(x+.5-w/2)/k;let dm=1e9;for(let n=0;n<=4;n++){const t=n/4,lx=X-cx-ox*t,ly=Y-cy-oy*t,ux=Math.abs(ca*lx+sa*ly)-e,uy=Math.abs(-sa*lx+ca*ly)-e,dd=Math.hypot(Math.max(ux,0),Math.max(uy,0))+Math.min(Math.max(ux,uy),0)-rr;if(dd<dm)dm=dd}
+const a=op*(1-sm(-soft,soft,dm));if(a>.002){const p=(y*w+x)*3,f=1-a;col[p]*=f;col[p+1]*=f;col[p+2]*=f}}}}
+function dieShadow(col,w,h,k,d,st){const s=d.s,X=d.pos[0],Y=d.pos[1],hg=Math.max(0,d.pos[2]-s),R=qmat(d.q),ang=Math.atan2(R[3],R[0]),kx=-L[0]/L[2],ky=-L[1]/L[2];
+shadowPass(col,w,h,k,X+kx*hg,Y+ky*hg,2*s*kx,2*s*ky,ang,s*.95,s*.3+hg*.15,1.5+hg*.12,st.shadow*70/(70+hg));
+if(hg<20)shadowPass(col,w,h,k,X,Y,0,0,ang,s*1.02,s*.4,2.5+hg*.3,.45*(1-hg/20))}
+const CB={},ZB={};
+function render(dev,k){if(!CB[k]){CB[k]=new Float32Array(W*k*H*k*3);ZB[k]=new Float32Array(W*k*H*k)}const col=CB[k],zb=ZB[k],w=W*k,h=H*k;col.set(getBg(k));zb.fill(-1e9);
+for(const d of dev.dice)dieShadow(col,w,h,k,d,ST);for(const d of dev.dice)drawDie(col,zb,w,h,k,d,ST);
+const o=dev.scene.data,n=1/(k*k);for(let y=0;y<H;y++)for(let x=0;x<W;x++){let r=0,g=0,b=0;for(let j=0;j<k;j++){let p=((y*k+j)*w+x*k)*3;for(let i=0;i<k;i++,p+=3){r+=tm(col[p]);g+=tm(col[p+1]);b+=tm(col[p+2])}}const q=(y*W+x)*4;o[q]=LUT[Math.min(4095,(r*n*4095)|0)];o[q+1]=LUT[Math.min(4095,(g*n*4095)|0)];o[q+2]=LUT[Math.min(4095,(b*n*4095)|0)];o[q+3]=255}}
+const sizeFor=m=>m===1?27:22;
+function bounds(s){const m=1.45*s;return{xr:67-m,y0:VB.yT+m,y1:VB.yB-m}}
+function clampP(s,p){const b=bounds(s);return[Math.max(-b.xr,Math.min(b.xr,p[0])),Math.max(b.y0,Math.min(b.y1,p[1]))]}
+function placeFinal(mode){const s=sizeFor(mode),b=bounds(s),out=[];for(let i=0;i<mode;i++){let p,t=0;do{p=[rnd(-b.xr,b.xr),rnd(b.y0,b.y1)];t++}while(t<300&&out.some(o=>Math.hypot(o[0]-p[0],o[1]-p[1])<3.1*s));out.push(p)}return out}
+function placeFree(s,p0){const b=bounds(s);for(let t=0;t<300;t++){const p=[rnd(-b.xr,b.xr),rnd(b.y0,b.y1)];if(Math.hypot(p[0]-p0[0],p[1]-p0[1])>=3.1*s)return p}return clampP(s,[-p0[0],-p0[1]])}
+const P1=[[6,-8]],P2=[[-20,-22],[22,20]];
+function preset(dev,mode,vals,pos,yaws){dev.mode=mode;const s=sizeFor(mode);dev.dice=vals.map((val,i)=>{const p=clampP(s,pos[i]);return{pos:[p[0],p[1],s],q:qUp(val,yaws[i]),s}});dev.result=vals.slice();dev.screen='idle';dev.dirty=true;dev.toast=null;dev.roll=null;dev.pending=null}
+function toggleMode(dev){dev.mode=3-dev.mode;const s=sizeFor(dev.mode),d0=dev.dice[0],p0=clampP(s,d0.pos),dice=[{pos:[p0[0],p0[1],s],q:d0.q,s}];if(dev.mode===2){const f=placeFree(s,p0);dice.push({pos:[f[0],f[1],s],q:qUp(rv(),rnd(0,TAU)),s})}dev.dice=dice;dev.result=null;dev.screen='idle';dev.toast={t0:now()};dev.dirty=true}
+const TB=[0,.36,.6,.75,.9];
+function startRoll(dev,vals,snd){const s=sizeFor(dev.mode);if(dev.dice.length!==dev.mode)preset(dev,dev.mode,vals,dev.mode===1?P1:P2,[0,0]);const b=bounds(s),fins=placeFinal(dev.mode),T=1.9;
+const plans=dev.dice.map((d,i)=>{const fq=qUp(vals[i],rnd(0,TAU)),RP=()=>[rnd(-b.xr,b.xr),rnd(b.y0,b.y1)],f=fins[i],a=rnd(0,TAU),w3=clampP(s,[f[0]+Math.cos(a)*s*1.1,f[1]+Math.sin(a)*s*1.1]);
+let mx=f[0]-w3[0],my=f[1]-w3[1];if(Math.hypot(mx,my)<1e-3){mx=Math.cos(a);my=Math.sin(a)}const tr=nrm([mx,my,0]),ax1=[tr[1],-tr[0],0],ax2=nrm([rnd(-1,1),rnd(-1,1),rnd(-.3,.3)]),A1=TAU*rnd(2.2,3.2),A2=TAU*rnd(.5,1),h0=rnd(70,95);
+const q0=qm(qa(ax1,A1),qm(qa(ax2,A2),fq));return{wp:[[d.pos[0],d.pos[1]],RP(),RP(),w3,f],fq,ax1,A1,ax2,A2,h:[h0,h0*.3,h0*.09],z0:d.pos[2],corr0:qm(qi(q0),d.q),delay:i*.07,s}});
+dev.roll={t0:now(),T,vals,plans};dev.result=null;dev.screen='roll';dev.toast=null;
+if(snd&&SND.checked&&AC){const c=AC.currentTime+.03;plans.forEach(p=>{[1,2,3].forEach((j,n)=>clack(c+T*(p.delay+TB[j]*.93),[1,.6,.32][n]));clack(c+T*(p.delay+.8*.93),.1);clack(c+T*(p.delay+.86*.93),.06)})}}
+function poseAt(p,f){const s=p.s,wp=p.wp;let x,y,z;
+if(f<TB[3]){const i=f<TB[1]?0:f<TB[2]?1:2,t=(f-TB[i])/(TB[i+1]-TB[i]),a=wp[i],b=wp[i+1];x=a[0]+(b[0]-a[0])*t;y=a[1]+(b[1]-a[1])*t;z=(i===0?p.z0+(s-p.z0)*t:s)+p.h[i]*4*t*(1-t)}
+else if(f<TB[4]){const t=(f-TB[3])/(TB[4]-TB[3]),e=1-Math.pow(1-t,3);x=wp[3][0]+(wp[4][0]-wp[3][0])*e;y=wp[3][1]+(wp[4][1]-wp[3][1])*e;z=s}else{x=wp[4][0];y=wp[4][1];z=s}
+const g=f<TB[4]?Math.pow(1-f/TB[4],2):0;let q=qm(qa(p.ax1,p.A1*g),qm(qa(p.ax2,p.A2*Math.pow(g,1.5)),qm(p.fq,qs(p.corr0,[1,0,0,0],sm(0,.3,f)))));
+if(f>TB[4]){const t=(f-TB[4])/(1-TB[4]),an=.09*Math.sin(t*Math.PI*3)*(1-t)*(1-t);q=qm(qa(p.ax1,an),q);z+=s*.9*Math.abs(an)}return{pos:[x,y,z],q}}
+function stepRoll(dev,t){const R=dev.roll,el=t-R.t0;if(el>=R.T){dev.dice=R.plans.map(p=>({pos:[p.wp[4][0],p.wp[4][1],p.s],q:p.fq,s:p.s}));dev.result=R.vals;dev.roll=null;dev.screen='idle';dev.dirty=true;dev.landT=t;return}
+dev.dice=R.plans.map(p=>{const f=Math.min(1,Math.max(0,(el/R.T-p.delay)/.93)),ps=poseAt(p,f);return{pos:ps.pos,q:ps.q,s:p.s}})}
+function splashDice(t){const s=24;return[{pos:[-20,-6+3*Math.sin(t*1.3),50+6*Math.sin(t*1.1)],q:qm(qa([.4,1,.25],t*.7),qUp(5,.4)),s},{pos:[22,38+3*Math.sin(t*1.2+1),32+6*Math.sin(t*1.5+2)],q:qm(qa([1,.3,.6],-t*.6),qUp(6,-.3)),s}]}
+let AC=null,NB=null;
+function ac(){if(!AC){AC=new(window.AudioContext||window.webkitAudioContext)();NB=AC.createBuffer(1,Math.floor(AC.sampleRate*.1),AC.sampleRate);const d=NB.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1}if(AC.state==='suspended')AC.resume()}
+function env(g,t,a,dec){g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,a),t+.002);g.gain.exponentialRampToValueAtTime(.0001,t+dec)}
+function clack(t,a){const c=AC,n=c.createBufferSource();n.buffer=NB;const f=c.createBiquadFilter();f.type='bandpass';f.frequency.value=1800+Math.random()*2200;f.Q.value=2.5;const g=c.createGain();env(g,t,.9*a,.045);n.connect(f);f.connect(g);g.connect(c.destination);n.start(t);n.stop(t+.06);
+const o=c.createOscillator();o.frequency.value=2600+Math.random()*1400;const g2=c.createGain();env(g2,t,.22*a,.07);o.connect(g2);g2.connect(c.destination);o.start(t);o.stop(t+.08);
+const o2=c.createOscillator();o2.type='triangle';o2.frequency.value=300+Math.random()*120;const g3=c.createGain();env(g3,t,.35*a,.05);o2.connect(g3);g3.connect(c.destination);o2.start(t);o2.stop(t+.06)}
+function rattle(){const c=AC.currentTime;for(let i=0;i<9;i++)clack(c+i*.05+Math.random()*.02,rnd(.18,.4))}
+function rr(c,x,y,w,h,r){c.beginPath();c.roundRect(x,y,w,h,r)}
+function toastA(d,t){if(!d.toast)return 0;const e=t-d.toast.t0;return e<.15?e/.15:e>1.05?Math.max(0,(1.2-e)/.15):1}
+const ease=x=>{x=Math.min(1,Math.max(0,x));return x*x*(3-2*x)};
+const HF='"Helvetica Neue",Helvetica,Arial,sans-serif',IV='243,234,210';
+function ui(c,d,t){c.textAlign='center';c.textBaseline='alphabetic';
+if(d.screen==='splash'){c.fillStyle=`rgb(${IV})`;c.font='300 15px '+HF;c.fillText('D  I  C  E',W/2,40);c.fillRect(W/2-14,50,28,1);c.fillStyle=`rgba(${IV},.6)`;c.font='10px '+HF;c.fillText('P R E S S   O R   S H A K E',W/2,228);return}
+for(let i=0;i<2;i++){rr(c,8.5+i*12,8.5,9,9,2);if(i<d.mode){c.fillStyle=`rgb(${IV})`;c.fill()}else{c.strokeStyle=`rgba(${IV},.45)`;c.lineWidth=1;c.stroke()}}
+if(d.screen==='idle'){const r=d.result;if(r){const a=d.landT?ease((t-d.landT-.15)/.35):1;if(a>0){const txt=r.length===1?String(r[0]):r[0]+'  +  '+r[1]+'  =  '+(r[0]+r[1]);c.font='300 17px '+HF;const pw=Math.max(40,c.measureText(txt).width+28);c.globalAlpha=a;rr(c,(W-pw)/2,H-36+(1-a)*6,pw,24,12);c.fillStyle=`rgba(${IV},.93)`;c.fill();c.fillStyle='#2b2620';c.textBaseline='middle';c.fillText(txt,W/2,H-23.5+(1-a)*6);c.textBaseline='alphabetic';c.globalAlpha=1}}
+else{c.fillStyle=`rgba(${IV},.6)`;c.font='10px '+HF;c.fillText('P R E S S   O R   S H A K E',W/2,H-18)}}
+const a=toastA(d,t);if(a>0){c.fillStyle=`rgba(8,22,15,${.6*a})`;c.fillRect(0,0,W,H);c.fillStyle=`rgba(${IV},${a})`;c.font='200 64px '+HF;c.fillText(String(d.mode),W/2,138);c.fillRect(W/2-14,148,28,1);c.font='10px '+HF;c.fillText(d.mode===1?'O N E   D I E':'T W O   D I C E',W/2,166)}}
+const SND=document.getElementById('snd');
+const DEVS=[0,1].map(i=>{const cv=document.getElementById('c'+i),ctx=cv.getContext('2d');return{ctx,body:document.getElementById('b'+i),scene:ctx.createImageData(W,H),mode:2,screen:'splash',dice:[],result:null,dirty:true,toast:null,roll:null,pending:null,last:0,redraw:false,landT:null}});
+preset(DEVS[1],2,[3,4],P2,[.5,-.35]);
+function wake(d){d.screen='idle';if(!d.dice.length||d.dice.length!==d.mode)preset(d,2,[3,4],P2,[.5,-.35]);d.dirty=true}
+function act(d,a){if(SND.checked)ac();const t=now();
+if(d.screen==='sleep'){wake(d);return}if(d.screen==='roll'||d.pending||a==='wake')return;
+if(a==='mode'){if(d.screen==='splash'){preset(d,2,[3,4],P2,[.5,-.35]);d.result=null}else toggleMode(d);return}
+const vals=[rv(),rv()].slice(0,d.mode);
+if(a==='roll'){startRoll(d,vals,true);return}
+if(a==='shake'){d.body.classList.remove('shaking');void d.body.offsetWidth;d.body.classList.add('shaking');if(SND.checked&&AC)rattle();d.pending={at:t+.5,vals}}}
+DEVS.forEach(d=>{d.body.parentElement.querySelectorAll('[data-a]').forEach(b=>b.onclick=()=>act(d,b.dataset.a));d.body.querySelector('.k1').onclick=()=>act(d,'roll');d.body.querySelector('.k2').onclick=()=>act(d,'mode')});
+document.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>{if(SND.checked)ac();const s=b.dataset.s,vals=[rv(),rv()];
+DEVS.forEach((d,i)=>{d.pending=null;
+if(s==='splash'){d.screen='splash';d.mode=2;d.result=null;d.roll=null;d.toast=null}
+else if(s==='one')preset(d,1,[5],P1,[.35]);
+else if(s==='two')preset(d,2,[3,4],P2,[.5,-.35]);
+else if(s==='roll'){if(d.screen!=='idle')preset(d,2,[3,4],P2,[.5,-.35]);startRoll(d,vals.slice(0,d.mode),i===0)}
+else if(s==='mode'){if(d.screen!=='idle')preset(d,1,[5],P1,[.35]);toggleMode(d)}
+else if(s==='off'){d.screen='sleep';d.dirty=true;d.toast=null;d.roll=null}})});
+function update(d,t){if(d.pending&&t>=d.pending.at){const v=d.pending.vals;d.pending=null;startRoll(d,v,true)}
+if(d.screen==='sleep'){if(d.dirty){d.ctx.fillStyle='#000';d.ctx.fillRect(0,0,W,H);d.dirty=false}return}
+const live=d.screen==='splash'||d.screen==='roll';
+const fading=d.screen==='idle'&&d.landT&&t-d.landT<.6;
+const tOn=d.toast&&t-d.toast.t0<1.2;if(d.toast&&!tOn){d.toast=null;d.redraw=true}
+if(live){if(t-d.last<1/40)return;d.last=t;if(d.screen==='splash')d.dice=splashDice(t);else stepRoll(d,t);render(d,d.screen==='idle'?2:1);if(d.screen==='idle')d.dirty=false}
+else if(d.dirty){render(d,2);d.dirty=false}else if(!tOn&&!d.redraw&&!fading)return;
+d.redraw=false;d.ctx.putImageData(d.scene,0,0);ui(d.ctx,d,t)}
+function frame(){const t=now();DEVS.forEach(d=>update(d,t));requestAnimationFrame(frame)}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
