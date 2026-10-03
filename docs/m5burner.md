@@ -7,7 +7,7 @@
 | Device | StickS3 |
 | Version | v1.0.0 |
 | File | `dist/M5Dice-v1.0.0.bin`, a full image flashed at 0x0 |
-| Cover | `dist/M5Dice-cover.png` (1440 x 810) |
+| Cover | `dist/M5Dice-cover.png` (1440 x 810); a copy is `docs/cover.png`, shown in the README |
 | Project link | https://github.com/mbogatyr/M5Dice |
 | Visibility | Public |
 | Uploaded | 2026-10-03, "Pending" review |
