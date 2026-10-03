@@ -3,6 +3,7 @@
 //
 //   tools/preview/build.sh && /tmp/dice_preview /tmp/sheet.png [seed]
 //   afplay /tmp/dice_roll.wav; afplay /tmp/dice_rattle.wav
+//   /tmp/dice_preview --frames /tmp/frames [seed]   # single frames, for covers
 //
 // Frames, 2x size, four to a row: the splash, a throw of one die at several
 // moments, the rest frames of one and two dice, the mode switch toast, the
@@ -180,9 +181,59 @@ struct Rig {
     }
 };
 
+// Saves one frame at its real size.
+void saveFrame(const char *dir, const char *name, const uint16_t *frame) {
+    std::vector<uint8_t> rgb(kW * kH * 3);
+    for (int i = 0; i < kW * kH; ++i) {
+        const uint16_t c = static_cast<uint16_t>((frame[i] >> 8) | (frame[i] << 8));
+        const int r = c >> 11, g = (c >> 5) & 0x3F, b = c & 0x1F;
+        rgb[i * 3] = static_cast<uint8_t>((r << 3) | (r >> 2));
+        rgb[i * 3 + 1] = static_cast<uint8_t>((g << 2) | (g >> 4));
+        rgb[i * 3 + 2] = static_cast<uint8_t>((b << 3) | (b >> 2));
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.png", dir, name);
+    writePng(path, kW, kH, rgb);
+}
+
+// The splash, two dice in the air at several moments, and the rest frames.
+int frames(const char *dir, uint32_t seed) {
+    Rig rig(seed);
+    uint32_t now = 0;
+    rig.app.begin(now);
+    rig.run(now, 1300);
+    saveFrame(dir, "splash", rig.frame.data());
+    DiceApp::Input key1{}, key2{};
+    key1.key1 = true;
+    key2.key2 = true;
+    rig.tick(now += 33, key2); // the table, one die
+    rig.tick(now += 33, key2); // two dice
+    rig.run(now, now + 1500);
+    rig.tick(now += 33, key1);
+    const uint32_t start = now;
+    char name[32];
+    for (uint32_t at = 100; at <= 1300; at += 100) {
+        rig.run(now, start + DiceApp::kSoundLeadMs + at);
+        snprintf(name, sizeof name, "flight2_%04u", at);
+        saveFrame(dir, name, rig.frame.data());
+    }
+    rig.run(now, start + 2600);
+    saveFrame(dir, "result2", rig.frame.data());
+    rig.tick(now += 33, key2); // one die
+    rig.run(now, now + 1500);
+    rig.tick(now += 33, key1);
+    rig.run(now, now + 2600);
+    saveFrame(dir, "result1", rig.frame.data());
+    printf("frames -> %s\n", dir);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[1], "--frames") == 0) {
+        return frames(argv[2], argc > 3 ? static_cast<uint32_t>(atoi(argv[3])) : 7);
+    }
     const char *out = argc > 1 ? argv[1] : "/tmp/dice_sheet.png";
     const uint32_t seed = argc > 2 ? static_cast<uint32_t>(atoi(argv[2])) : 7;
 
